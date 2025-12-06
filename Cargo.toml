@@ -1,6 +1,6 @@
 [package]
 name = "cargo-quality"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2024"
 authors = ["RAprogramm <andrey.rozanov.vl@gmail.com>"]
 description = "Professional Rust code quality analysis tool with hardcoded standards"
@@ -29,7 +29,7 @@ unicode-width = "0.2"
 console = "0.16"
 
 [dev-dependencies]
-criterion = "0.7"
+criterion = "0.8"
 tempfile = "3"
 
 [profile.release]
