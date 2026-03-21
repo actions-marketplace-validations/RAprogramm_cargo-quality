@@ -89,6 +89,10 @@ fn main() -> AppResult<()> {
             setup_completions()?;
             return Ok(());
         }
+        Command::ModRs {
+            path,
+            fix
+        } => run_mod_rs(&path, fix)?
     }
 
     Ok(())
@@ -321,6 +325,40 @@ fn install_generated_completions(shell: Shell, comp_file: &std::path::Path) -> A
     Ok(())
 }
 
+/// Run mod.rs analyzer.
+///
+/// Finds mod.rs files and optionally fixes them.
+///
+/// # Arguments
+///
+/// * `path` - Path to analyze
+/// * `fix` - Apply fixes automatically
+fn run_mod_rs(path: &str, fix: bool) -> AppResult<()> {
+    let result = find_mod_rs_issues(path)?;
+
+    if result.is_empty() {
+        println!("No mod.rs files found");
+        return Ok(());
+    }
+
+    if fix {
+        let fixed = fix_all_mod_rs(path)?;
+        println!("Fixed {} mod.rs files", fixed);
+    } else {
+        println!("Found {} mod.rs files:", result.len());
+        for issue in &result.issues {
+            println!(
+                "  {} -> {}",
+                issue.path.display(),
+                issue.suggested.display()
+            );
+        }
+        println!("\nRun with --fix to apply changes");
+    }
+
+    Ok(())
+}
+
 /// Check code quality without modifying files.
 ///
 /// Analyzes all Rust files in the specified path and reports issues found
@@ -362,11 +400,11 @@ fn check_quality(
         all_analyzers
     };
 
-    if analyzers.is_empty() && analyzer_name.is_some() && analyzer_name != Some("mod_rs") {
-        eprintln!(
-            "Unknown analyzer: {}. Available analyzers:",
-            analyzer_name.unwrap()
-        );
+    if let Some(name) = analyzer_name
+        && analyzers.is_empty()
+        && name != "mod_rs"
+    {
+        eprintln!("Unknown analyzer: {}. Available analyzers:", name);
         for analyzer in get_analyzers() {
             eprintln!("  - {}", analyzer.name());
         }
@@ -480,11 +518,11 @@ fn fix_quality(path: &str, dry_run: bool, analyzer_name: Option<&str>) -> AppRes
         all_analyzers
     };
 
-    if analyzers.is_empty() && analyzer_name.is_some() && analyzer_name != Some("mod_rs") {
-        eprintln!(
-            "Unknown analyzer: {}. Available analyzers:",
-            analyzer_name.unwrap()
-        );
+    if let Some(name) = analyzer_name
+        && analyzers.is_empty()
+        && name != "mod_rs"
+    {
+        eprintln!("Unknown analyzer: {}. Available analyzers:", name);
         for analyzer in get_analyzers() {
             eprintln!("  - {}", analyzer.name());
         }
@@ -600,11 +638,10 @@ fn run_diff(
         all_analyzers
     };
 
-    if analyzers.is_empty() && analyzer_name.is_some() {
-        eprintln!(
-            "Unknown analyzer: {}. Available analyzers:",
-            analyzer_name.unwrap()
-        );
+    if let Some(name) = analyzer_name
+        && analyzers.is_empty()
+    {
+        eprintln!("Unknown analyzer: {}. Available analyzers:", name);
         for analyzer in get_analyzers() {
             eprintln!("  - {}", analyzer.name());
         }
