@@ -12,7 +12,7 @@ use console::measure_text_width;
 use owo_colors::OwoColorize;
 use terminal_size::{Width, terminal_size};
 
-use crate::analyzer::AnalysisResult;
+use crate::{analyzer::AnalysisResult, differ::display::types::RenderedFile};
 
 /// Minimum space between columns in grid layout.
 const COLUMN_GAP: usize = 4;
@@ -23,11 +23,8 @@ const MIN_ANALYZER_WIDTH: usize = 40;
 /// Maximum width for an analyzer column to enable multi-column layout.
 const MAX_ANALYZER_WIDTH: usize = 80;
 
-/// Rendered analyzer block for grid layout.
-struct RenderedAnalyzer {
-    lines: Vec<String>,
-    width: usize
-}
+/// Rendered analyzer block for grid layout, sharing the rendered-block shape.
+type RenderedAnalyzer = RenderedFile;
 
 /// Renders a single analyzer block with issues.
 fn render_analyzer_block(
@@ -82,9 +79,12 @@ fn render_analyzer_block(
                 lines_str.join(", ")
             };
 
-            if joined.len() > 60 {
+            let plain_joined_len = lines_str.join(", ").len();
+
+            if plain_joined_len > 60 {
                 let mut line_chunks = Vec::new();
                 let mut current_line = String::new();
+                let mut current_len = 0;
 
                 for (i, line_num) in lines_str.iter().enumerate() {
                     let separator = if i == 0 { "" } else { ", " };
@@ -96,15 +96,17 @@ fn render_analyzer_block(
 
                     let addition_len = separator.len() + line_num.len();
 
-                    if current_line.len() + addition_len > 60 && !current_line.is_empty() {
+                    if current_len + addition_len > 60 && current_len > 0 {
                         line_chunks.push(current_line.clone());
                         current_line = if color {
                             format!("{}", line_num.magenta())
                         } else {
                             line_num.clone()
                         };
+                        current_len = line_num.len();
                     } else {
                         current_line.push_str(&addition);
+                        current_len += addition_len;
                     }
                 }
 
@@ -321,7 +323,11 @@ impl fmt::Display for Report {
 
             writeln!(f, "\n[{}]", analyzer_name)?;
             for issue in &result.issues {
-                write!(f, "  {}:{} - {}", issue.line, issue.column, issue.message)?;
+                write!(
+                    f,
+                    "  {}:{} - {}",
+                    issue.diagnostic.line, issue.diagnostic.column, issue.diagnostic.message
+                )?;
                 if issue.fix.is_available() {
                     if let Some((import, _pattern, _replacement)) = issue.fix.as_import() {
                         write!(f, "\n    Fix: Add import: {}", import)?;
@@ -372,51 +378,76 @@ impl GlobalReport {
         self.reports.iter().map(|r| r.total_fixable()).sum()
     }
 
+    /// Borrows a renderer exposing the report's display modes.
+    ///
+    /// # Returns
+    ///
+    /// A renderer bound to this report
+    #[inline]
+    pub fn renderer(&self) -> GlobalReportRenderer<'_> {
+        GlobalReportRenderer {
+            report: self
+        }
+    }
+}
+
+/// Renders a [`GlobalReport`] in its compact, per-analyzer, and verbose modes.
+///
+/// Splitting rendering from aggregation keeps the report type focused on
+/// collecting results while this type owns the output formats.
+pub struct GlobalReportRenderer<'report> {
+    /// Report being rendered
+    report: &'report GlobalReport
+}
+
+impl<'report> GlobalReportRenderer<'report> {
     /// Display summary only (total issues and fixable count).
-    pub fn display_compact(&self, color: bool) -> String {
+    pub fn compact(&self, color: bool) -> String {
         let mut output = String::new();
 
         if color {
             output.push_str(&format!(
                 "{}: {}\n",
                 "Total issues".green().bold(),
-                self.total_issues().to_string().green().bold()
+                self.report.total_issues().to_string().green().bold()
             ));
             output.push_str(&format!(
                 "{}: {}\n",
                 "Fixable".green().bold(),
-                self.total_fixable().to_string().green().bold()
+                self.report.total_fixable().to_string().green().bold()
             ));
         } else {
-            output.push_str(&format!("Total issues: {}\n", self.total_issues()));
-            output.push_str(&format!("Fixable: {}\n", self.total_fixable()));
+            output.push_str(&format!("Total issues: {}\n", self.report.total_issues()));
+            output.push_str(&format!("Fixable: {}\n", self.report.total_fixable()));
         }
 
         output
     }
 
     /// Display details for a specific analyzer only.
-    pub fn display_analyzer(&self, analyzer_name: &str, color: bool) -> String {
+    pub fn analyzer(&self, analyzer_name: &str, color: bool) -> String {
         type FileLines = Vec<(String, Vec<usize>)>;
         type MessageGroups = HashMap<String, FileLines>;
 
         let mut message_map: MessageGroups = HashMap::new();
 
-        for report in &self.reports {
+        for report in &self.report.reports {
             for (name, result) in &report.results {
                 if name != analyzer_name || result.issues.is_empty() {
                     continue;
                 }
 
                 for issue in &result.issues {
-                    let file_list = message_map.entry(issue.message.clone()).or_default();
+                    let file_list = message_map
+                        .entry(issue.diagnostic.message.clone())
+                        .or_default();
 
                     if let Some((_, lines)) =
                         file_list.iter_mut().find(|(f, _)| f == &report.file_path)
                     {
-                        lines.push(issue.line);
+                        lines.push(issue.diagnostic.line);
                     } else {
-                        file_list.push((report.file_path.clone(), vec![issue.line]));
+                        file_list.push((report.file_path.clone(), vec![issue.diagnostic.line]));
                     }
                 }
             }
@@ -440,16 +471,16 @@ impl GlobalReport {
             output.push_str(&format!(
                 "{}: {}\n",
                 "Total issues".green().bold(),
-                self.total_issues().to_string().green().bold()
+                self.report.total_issues().to_string().green().bold()
             ));
             output.push_str(&format!(
                 "{}: {}\n",
                 "Fixable".green().bold(),
-                self.total_fixable().to_string().green().bold()
+                self.report.total_fixable().to_string().green().bold()
             ));
         } else {
-            output.push_str(&format!("Total issues: {}\n", self.total_issues()));
-            output.push_str(&format!("Fixable: {}\n", self.total_fixable()));
+            output.push_str(&format!("Total issues: {}\n", self.report.total_issues()));
+            output.push_str(&format!("Fixable: {}\n", self.report.total_fixable()));
         }
 
         output
@@ -459,14 +490,14 @@ impl GlobalReport {
     ///
     /// Groups issues by analyzer and message across all files,
     /// then shows which files have each issue in grid layout.
-    pub fn display_verbose(&self, color: bool) -> String {
+    pub fn verbose(&self, color: bool) -> String {
         type FileLines = Vec<(String, Vec<usize>)>;
         type MessageGroups = HashMap<String, FileLines>;
         type AnalyzerGroups = HashMap<String, MessageGroups>;
 
         let mut analyzer_groups: AnalyzerGroups = HashMap::new();
 
-        for report in &self.reports {
+        for report in &self.report.reports {
             for (analyzer_name, result) in &report.results {
                 if result.issues.is_empty() {
                     continue;
@@ -475,14 +506,16 @@ impl GlobalReport {
                 let message_map = analyzer_groups.entry(analyzer_name.clone()).or_default();
 
                 for issue in &result.issues {
-                    let file_list = message_map.entry(issue.message.clone()).or_default();
+                    let file_list = message_map
+                        .entry(issue.diagnostic.message.clone())
+                        .or_default();
 
                     if let Some((_, lines)) =
                         file_list.iter_mut().find(|(f, _)| f == &report.file_path)
                     {
-                        lines.push(issue.line);
+                        lines.push(issue.diagnostic.line);
                     } else {
-                        file_list.push((report.file_path.clone(), vec![issue.line]));
+                        file_list.push((report.file_path.clone(), vec![issue.diagnostic.line]));
                     }
                 }
             }
@@ -511,16 +544,16 @@ impl GlobalReport {
             output.push_str(&format!(
                 "\n{}: {}\n",
                 "Total issues".green().bold(),
-                self.total_issues().to_string().green().bold()
+                self.report.total_issues().to_string().green().bold()
             ));
             output.push_str(&format!(
                 "{}: {}\n",
                 "Fixable".green().bold(),
-                self.total_fixable().to_string().green().bold()
+                self.report.total_fixable().to_string().green().bold()
             ));
         } else {
-            output.push_str(&format!("\nTotal issues: {}\n", self.total_issues()));
-            output.push_str(&format!("Fixable: {}\n", self.total_fixable()));
+            output.push_str(&format!("\nTotal issues: {}\n", self.report.total_issues()));
+            output.push_str(&format!("Fixable: {}\n", self.report.total_fixable()));
         }
 
         output
@@ -561,12 +594,7 @@ mod tests {
     fn test_report_total_issues() {
         let mut report = Report::new("test.rs".to_string());
 
-        let issue = Issue {
-            line:    1,
-            column:  1,
-            message: "Test".to_string(),
-            fix:     crate::analyzer::Fix::None
-        };
+        let issue = Issue::new(1, 1, "Test".to_string(), crate::analyzer::Fix::None);
 
         let result = AnalysisResult {
             issues:        vec![issue],
@@ -582,12 +610,12 @@ mod tests {
     fn test_report_display_with_issues() {
         let mut report = Report::new("test.rs".to_string());
 
-        let issue = Issue {
-            line:    42,
-            column:  15,
-            message: "Test issue".to_string(),
-            fix:     crate::analyzer::Fix::Simple("Fix suggestion".to_string())
-        };
+        let issue = Issue::new(
+            42,
+            15,
+            "Test issue".to_string(),
+            crate::analyzer::Fix::Simple("Fix suggestion".to_string())
+        );
 
         let result = AnalysisResult {
             issues:        vec![issue],
@@ -627,12 +655,12 @@ mod tests {
     fn test_report_display_issue_without_suggestion() {
         let mut report = Report::new("file.rs".to_string());
 
-        let issue = Issue {
-            line:    10,
-            column:  5,
-            message: "Warning message".to_string(),
-            fix:     crate::analyzer::Fix::None
-        };
+        let issue = Issue::new(
+            10,
+            5,
+            "Warning message".to_string(),
+            crate::analyzer::Fix::None
+        );
 
         let result = AnalysisResult {
             issues:        vec![issue],
@@ -650,19 +678,14 @@ mod tests {
     fn test_report_multiple_analyzers() {
         let mut report = Report::new("code.rs".to_string());
 
-        let issue1 = Issue {
-            line:    1,
-            column:  1,
-            message: "Issue 1".to_string(),
-            fix:     crate::analyzer::Fix::Simple("Fix 1".to_string())
-        };
+        let issue1 = Issue::new(
+            1,
+            1,
+            "Issue 1".to_string(),
+            crate::analyzer::Fix::Simple("Fix 1".to_string())
+        );
 
-        let issue2 = Issue {
-            line:    2,
-            column:  2,
-            message: "Issue 2".to_string(),
-            fix:     crate::analyzer::Fix::None
-        };
+        let issue2 = Issue::new(2, 2, "Issue 2".to_string(), crate::analyzer::Fix::None);
 
         report.add_result(
             "analyzer1".to_string(),

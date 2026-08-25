@@ -1,6 +1,6 @@
 [package]
 name = "cargo-quality"
-version = "0.2.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["RAprogramm <andrey.rozanov.vl@gmail.com>"]
 description = "Professional Rust code quality analysis tool with hardcoded standards"
@@ -11,18 +11,22 @@ documentation = "https://docs.rs/cargo-quality"
 readme = "README.md"
 keywords = ["cargo", "quality", "formatter", "analyzer", "linter"]
 categories = ["development-tools", "command-line-utilities"]
-exclude = [".github", "target", ".git"]
-rust-version = "1.90"
+exclude = [".github", "target", ".git", "artifacts", "RELEASE_NOTES.md"]
+rust-version = "1.98"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-syn = { version = "2", features = ["full", "extra-traits", "visit", "visit-mut"] }
+syn = { version = "3", features = [
+  "full",
+  "extra-traits",
+  "visit",
+  "visit-mut",
+] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
-masterror = "0.25"
+masterror = "0.30"
 ignore = "0.4"
-prettyplease = "0.2"
 owo-colors = "4"
 terminal_size = "0.4"
 unicode-width = "0.2"

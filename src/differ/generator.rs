@@ -5,9 +5,9 @@ use std::fs;
 
 use masterror::AppResult;
 
-use super::types::{DiffEntry, FileDiff};
+use super::types::{ChangePreview, DiffEntry, FileDiff};
 use crate::{
-    analyzer::Analyzer,
+    analyzer::{Analyzer, Suggestion},
     error::{IoError, ParseError}
 };
 
@@ -27,8 +27,8 @@ use crate::{
 /// # Examples
 ///
 /// ```no_run
-/// use cargo_quality::{analyzers::get_analyzers, differ::generate_diff};
-/// let diff = generate_diff("src/main.rs", &get_analyzers()).unwrap();
+/// use cargo_quality::{analyzers::default_analyzers, differ::generate_diff};
+/// let diff = generate_diff("src/main.rs", &default_analyzers()).unwrap();
 /// ```
 pub fn generate_diff(file_path: &str, analyzers: &[Box<dyn Analyzer>]) -> AppResult<FileDiff> {
     let content = fs::read_to_string(file_path).map_err(IoError::from)?;
@@ -37,42 +37,62 @@ pub fn generate_diff(file_path: &str, analyzers: &[Box<dyn Analyzer>]) -> AppRes
     let mut file_diff = FileDiff::new(file_path.to_string());
 
     for analyzer in analyzers {
-        let result = analyzer.analyze(&ast, &content)?;
-
-        for issue in result.issues {
-            if issue.line == 0 || !issue.fix.is_available() {
-                continue;
-            }
-
-            let original_content = content
-                .lines()
-                .nth(issue.line.saturating_sub(1))
-                .unwrap_or("");
-
-            let (modified_line, import) =
-                if let Some((import, pattern, replacement)) = issue.fix.as_import() {
-                    let modified = original_content.replace(pattern, replacement);
-                    (modified, Some(import.to_string()))
-                } else if let Some(simple) = issue.fix.as_simple() {
-                    (simple.to_string(), None)
-                } else {
-                    continue;
-                };
-
-            let entry = DiffEntry {
-                line: issue.line,
-                analyzer: analyzer.name().to_string(),
-                original: original_content.to_string(),
-                modified: modified_line,
-                description: issue.message,
-                import
-            };
-
-            file_diff.add_entry(entry);
+        for suggestion in analyzer.suggestions(&ast, &content)? {
+            file_diff.add_entry(entry_from_suggestion(analyzer.name(), &content, suggestion));
         }
     }
 
     Ok(file_diff)
+}
+
+/// Builds a displayable diff entry from a fix suggestion.
+///
+/// Derives the affected line number and its before/after text from the
+/// suggestion's byte-range edit, and keeps the edit for application.
+///
+/// # Arguments
+///
+/// * `analyzer` - Name of the analyzer that produced the suggestion
+/// * `content` - Original source code
+/// * `suggestion` - Suggestion to render
+///
+/// # Returns
+///
+/// A `DiffEntry` for display and application
+fn entry_from_suggestion(analyzer: &str, content: &str, suggestion: Suggestion) -> DiffEntry {
+    let start = suggestion.edit.range.start;
+    let end = suggestion.edit.range.end;
+
+    let line = content[..start]
+        .bytes()
+        .filter(|&byte| byte == b'\n')
+        .count()
+        + 1;
+    let line_start = content[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = content[start..]
+        .find('\n')
+        .map_or(content.len(), |index| start + index);
+
+    let original = content[line_start..line_end].to_string();
+    let rel_start = start - line_start;
+    let rel_end = (end - line_start).min(original.len());
+    let modified = format!(
+        "{}{}{}",
+        &original[..rel_start],
+        suggestion.edit.replacement,
+        &original[rel_end..]
+    );
+
+    DiffEntry {
+        line,
+        analyzer: analyzer.to_string(),
+        preview: ChangePreview {
+            original,
+            modified,
+            description: format!("{} fix", analyzer)
+        },
+        suggestion
+    }
 }
 
 #[cfg(test)]
@@ -80,7 +100,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::analyzers::get_analyzers;
+    use crate::analyzers::default_analyzers;
 
     #[test]
     fn test_generate_diff_integration() {
@@ -92,7 +112,7 @@ mod tests {
         )
         .unwrap();
 
-        let analyzers = get_analyzers();
+        let analyzers = default_analyzers();
         let result = generate_diff(file_path.to_str().unwrap(), &analyzers);
 
         assert!(result.is_ok());
@@ -104,7 +124,7 @@ mod tests {
         let file_path = temp_dir.path().join("test.rs");
         std::fs::write(&file_path, "fn main() {}").unwrap();
 
-        let analyzers = get_analyzers();
+        let analyzers = default_analyzers();
         let result = generate_diff(file_path.to_str().unwrap(), &analyzers);
 
         assert!(result.is_ok());
@@ -116,7 +136,7 @@ mod tests {
         let file_path = temp_dir.path().join("test.rs");
         std::fs::write(&file_path, "fn main() { invalid syntax +++").unwrap();
 
-        let analyzers = get_analyzers();
+        let analyzers = default_analyzers();
         let result = generate_diff(file_path.to_str().unwrap(), &analyzers);
 
         assert!(result.is_err());
@@ -132,7 +152,7 @@ mod tests {
         )
         .unwrap();
 
-        let analyzers = get_analyzers();
+        let analyzers = default_analyzers();
         let result = generate_diff(file_path.to_str().unwrap(), &analyzers).unwrap();
 
         assert!(
@@ -151,7 +171,7 @@ mod tests {
         )
         .unwrap();
 
-        let analyzers = get_analyzers();
+        let analyzers = default_analyzers();
         let result = generate_diff(file_path.to_str().unwrap(), &analyzers).unwrap();
 
         for entry in &result.entries {

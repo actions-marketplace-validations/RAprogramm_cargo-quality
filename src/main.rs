@@ -21,15 +21,19 @@
 //! cargo qual format .
 //! ```
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::{self, BufWriter, Write},
+    path::PathBuf
+};
 
 use masterror::AppResult;
 
 use crate::{
     analyzer::{AnalysisResult, Fix, Issue},
-    analyzers::get_analyzers,
+    analyzers::default_analyzers,
     cli::{Command, QualityArgs, Shell},
-    differ::{DiffResult, generate_diff, show_full, show_interactive, show_summary},
+    differ::{DiffResult, apply_diff, generate_diff, show_full, show_interactive, show_summary},
     error::{IoError, ParseError},
     file_utils::collect_rust_files,
     mod_rs::{ModRsResult, find_mod_rs_issues, fix_all_mod_rs},
@@ -42,6 +46,7 @@ mod cli;
 mod differ;
 mod error;
 mod file_utils;
+mod fixer;
 mod formatter;
 mod help;
 mod mod_rs;
@@ -56,7 +61,7 @@ fn main() -> AppResult<()> {
             verbose,
             analyzer,
             color
-        } => check_quality(&path, verbose, analyzer.as_deref(), color)?,
+        } => std::process::exit(check_command(&path, verbose, analyzer.as_deref(), color)?),
         Command::Fix {
             path,
             dry_run,
@@ -133,11 +138,15 @@ fn generate_completions(shell: Shell) {
 fn setup_completions() -> AppResult<()> {
     let shell_name = detect_shell();
 
-    let Some((shell, comp_dir, file_name)) = get_completion_config(&shell_name) else {
-        println!("❌ Unsupported shell: {}", shell_name);
-        println!("Supported shells: bash, fish, zsh");
-        println!("\nManual installation:");
-        println!("  cargo qual completions <shell> > <completion-file>");
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let Some((shell, comp_dir, file_name)) = completion_config(&shell_name) else {
+        writeln!(out, "❌ Unsupported shell: {}", shell_name).map_err(IoError::from)?;
+        out.write_all(
+            b"Supported shells: bash, fish, zsh\n\nManual installation:\n  cargo qual completions <shell> > <completion-file>\n"
+        )
+        .map_err(IoError::from)?;
         return Ok(());
     };
 
@@ -150,16 +159,15 @@ fn setup_completions() -> AppResult<()> {
         install_generated_completions(shell, &comp_file)?;
     }
 
-    println!(
-        "✓ {} completions installed to: {}",
+    writeln!(
+        out,
+        "✓ {} completions installed to: {}\n\nCompletions will be available in new {} sessions\nOr run: source {}",
+        shell_name,
+        comp_file.display(),
         shell_name,
         comp_file.display()
-    );
-    println!(
-        "\nCompletions will be available in new {} sessions",
-        shell_name
-    );
-    println!("Or run: source {}", comp_file.display());
+    )
+    .map_err(IoError::from)?;
 
     Ok(())
 }
@@ -188,7 +196,7 @@ fn detect_shell() -> String {
 ///
 /// Home directory path or "~" if not found
 #[inline]
-fn get_home_dir() -> String {
+fn home_dir() -> String {
     use std::env;
 
     env::var("HOME").unwrap_or_else(|_| String::from("~"))
@@ -202,12 +210,12 @@ fn get_home_dir() -> String {
 ///
 /// Config directory path
 #[inline]
-fn get_xdg_config_home() -> PathBuf {
+fn xdg_config_home() -> PathBuf {
     use std::env;
 
     env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(get_home_dir()).join(".config"))
+        .unwrap_or_else(|_| PathBuf::from(home_dir()).join(".config"))
 }
 
 /// Gets XDG_DATA_HOME directory.
@@ -218,12 +226,12 @@ fn get_xdg_config_home() -> PathBuf {
 ///
 /// Data directory path
 #[inline]
-fn get_xdg_data_home() -> PathBuf {
+fn xdg_data_home() -> PathBuf {
     use std::env;
 
     env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(get_home_dir()).join(".local").join("share"))
+        .unwrap_or_else(|_| PathBuf::from(home_dir()).join(".local").join("share"))
 }
 
 /// Gets completion configuration for a shell.
@@ -237,20 +245,18 @@ fn get_xdg_data_home() -> PathBuf {
 /// # Returns
 ///
 /// Option<(Shell, PathBuf, &'static str)> - Shell type, directory, filename
-fn get_completion_config(shell_name: &str) -> Option<(Shell, PathBuf, &'static str)> {
+fn completion_config(shell_name: &str) -> Option<(Shell, PathBuf, &'static str)> {
     match shell_name {
         "fish" => {
-            let dir = get_xdg_config_home().join("fish").join("completions");
+            let dir = xdg_config_home().join("fish").join("completions");
             Some((Shell::Fish, dir, "cargo.fish"))
         }
         "bash" => {
-            let dir = get_xdg_data_home()
-                .join("bash-completion")
-                .join("completions");
+            let dir = xdg_data_home().join("bash-completion").join("completions");
             Some((Shell::Bash, dir, "cargo-quality"))
         }
         "zsh" => {
-            let dir = get_xdg_data_home().join("zsh").join("site-functions");
+            let dir = xdg_data_home().join("zsh").join("site-functions");
             Some((Shell::Zsh, dir, "_cargo-quality"))
         }
         _ => None
@@ -270,28 +276,28 @@ fn get_completion_config(shell_name: &str) -> Option<(Shell, PathBuf, &'static s
 /// `AppResult<()>` - Ok if installation succeeds
 fn install_fish_completions(comp_file: &std::path::Path) -> AppResult<()> {
     let fish_completions = r#"# Completion for cargo qual subcommand
-complete -c cargo -n "__fish_seen_subcommand_from quality" -s h -l help -d 'Print help'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "check" -d 'Check code quality'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "fix" -d 'Fix quality issues'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "format" -d 'Format code'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "fmt" -d 'Run cargo +nightly fmt'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "diff" -d 'Show proposed changes'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "help" -d 'Display help'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "completions" -d 'Generate completions'
-complete -c cargo -n "__fish_seen_subcommand_from quality" -f -a "setup" -d 'Setup completions'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -s h -l help -d 'Print help'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "check" -d 'Check code quality'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "fix" -d 'Fix quality issues'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "format" -d 'Format code'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "fmt" -d 'Run cargo +nightly fmt'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "diff" -d 'Show proposed changes'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "help" -d 'Display help'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "completions" -d 'Generate completions'
+complete -c cargo -n "__fish_seen_subcommand_from qual" -f -a "setup" -d 'Setup completions'
 
 # Diff options
-complete -c cargo -n "__fish_seen_subcommand_from quality; and __fish_seen_subcommand_from diff" -s s -l summary -d 'Brief summary'
-complete -c cargo -n "__fish_seen_subcommand_from quality; and __fish_seen_subcommand_from diff" -s i -l interactive -d 'Interactive mode'
+complete -c cargo -n "__fish_seen_subcommand_from qual; and __fish_seen_subcommand_from diff" -s s -l summary -d 'Brief summary'
+complete -c cargo -n "__fish_seen_subcommand_from qual; and __fish_seen_subcommand_from diff" -s i -l interactive -d 'Interactive mode'
 
 # Check options
-complete -c cargo -n "__fish_seen_subcommand_from quality; and __fish_seen_subcommand_from check" -s v -l verbose -d 'Detailed output'
+complete -c cargo -n "__fish_seen_subcommand_from qual; and __fish_seen_subcommand_from check" -s v -l verbose -d 'Detailed output'
 
 # Fix options
-complete -c cargo -n "__fish_seen_subcommand_from quality; and __fish_seen_subcommand_from fix" -s d -l dry-run -d 'Dry run'
+complete -c cargo -n "__fish_seen_subcommand_from qual; and __fish_seen_subcommand_from fix" -s d -l dry-run -d 'Dry run'
 
 # Completions options
-complete -c cargo -n "__fish_seen_subcommand_from quality; and __fish_seen_subcommand_from completions" -f -a "bash fish zsh powershell elvish"
+complete -c cargo -n "__fish_seen_subcommand_from qual; and __fish_seen_subcommand_from completions" -f -a "bash fish zsh powershell elvish"
 "#;
     fs::write(comp_file, fish_completions).map_err(IoError::from)?;
     Ok(())
@@ -336,25 +342,35 @@ fn install_generated_completions(shell: Shell, comp_file: &std::path::Path) -> A
 fn run_mod_rs(path: &str, fix: bool) -> AppResult<()> {
     let result = find_mod_rs_issues(path)?;
 
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
     if result.is_empty() {
-        println!("No mod.rs files found");
+        out.write_all(b"No mod.rs files found\n")
+            .map_err(IoError::from)?;
+        out.flush().map_err(IoError::from)?;
         return Ok(());
     }
 
     if fix {
         let fixed = fix_all_mod_rs(path)?;
-        println!("Fixed {} mod.rs files", fixed);
+        writeln!(out, "Fixed {} mod.rs files", fixed).map_err(IoError::from)?;
     } else {
-        println!("Found {} mod.rs files:", result.len());
+        writeln!(out, "Found {} mod.rs files:", result.len()).map_err(IoError::from)?;
         for issue in &result.issues {
-            println!(
+            writeln!(
+                out,
                 "  {} -> {}",
                 issue.path.display(),
                 issue.suggested.display()
-            );
+            )
+            .map_err(IoError::from)?;
         }
-        println!("\nRun with --fix to apply changes");
+        out.write_all(b"\nRun with --fix to apply changes\n")
+            .map_err(IoError::from)?;
     }
+
+    out.flush().map_err(IoError::from)?;
 
     Ok(())
 }
@@ -373,7 +389,9 @@ fn run_mod_rs(path: &str, fix: bool) -> AppResult<()> {
 ///
 /// # Returns
 ///
-/// `AppResult<()>` - Ok if analysis completes, error on IO or parse failures
+/// `AppResult<bool>` - `Ok(true)` if any issues were found, `Ok(false)` if the
+/// code is clean, error on IO or parse failures. The caller maps `true` to a
+/// non-zero process exit code so `check` can gate CI.
 ///
 /// # Examples
 ///
@@ -387,9 +405,9 @@ fn check_quality(
     verbose: bool,
     analyzer_name: Option<&str>,
     color: bool
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let files = collect_rust_files(path)?;
-    let all_analyzers = get_analyzers();
+    let all_analyzers = default_analyzers();
 
     let analyzers: Vec<_> = if let Some(name) = analyzer_name {
         all_analyzers
@@ -404,12 +422,8 @@ fn check_quality(
         && analyzers.is_empty()
         && name != "mod_rs"
     {
-        eprintln!("Unknown analyzer: {}. Available analyzers:", name);
-        for analyzer in get_analyzers() {
-            eprintln!("  - {}", analyzer.name());
-        }
-        eprintln!("  - mod_rs");
-        return Ok(());
+        report_unknown_analyzer(name, true)?;
+        return Ok(false);
     }
 
     let mut global_report = GlobalReport::new();
@@ -442,15 +456,64 @@ fn check_quality(
 
     if global_report.total_issues() > 0 {
         if let Some(analyzer) = analyzer_name {
-            print!("{}", global_report.display_analyzer(analyzer, color));
+            print!("{}", global_report.renderer().analyzer(analyzer, color));
         } else if verbose {
-            print!("{}", global_report.display_verbose(color));
+            print!("{}", global_report.renderer().verbose(color));
         } else {
-            print!("{}", global_report.display_compact(color));
+            print!("{}", global_report.renderer().compact(color));
         }
     } else {
-        print!("{}", global_report.display_compact(color));
+        print!("{}", global_report.renderer().compact(color));
     }
+
+    Ok(global_report.total_issues() > 0)
+}
+
+/// Runs the check command and maps the result to a process exit code.
+///
+/// # Arguments
+///
+/// * `path` - File or directory path to analyze
+/// * `verbose` - Print confirmation for files without issues
+/// * `analyzer_name` - Optional analyzer name to run
+/// * `color` - Enable colored output
+///
+/// # Returns
+///
+/// `AppResult<i32>` - `1` if any issues were found, `0` otherwise, error on IO
+/// or parse failures
+fn check_command(
+    path: &str,
+    verbose: bool,
+    analyzer_name: Option<&str>,
+    color: bool
+) -> AppResult<i32> {
+    let has_issues = check_quality(path, verbose, analyzer_name, color)?;
+    Ok(i32::from(has_issues))
+}
+
+/// Writes the unknown-analyzer error with the list of available analyzers.
+///
+/// # Arguments
+///
+/// * `name` - The analyzer name that failed to resolve
+/// * `include_mod_rs` - Whether to list `mod_rs` as an available analyzer
+///
+/// # Returns
+///
+/// `AppResult<()>` - Ok when the message was written
+fn report_unknown_analyzer(name: &str, include_mod_rs: bool) -> AppResult<()> {
+    let stderr = io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+
+    writeln!(err, "Unknown analyzer: {}. Available analyzers:", name).map_err(IoError::from)?;
+    for analyzer in default_analyzers() {
+        writeln!(err, "  - {}", analyzer.name()).map_err(IoError::from)?;
+    }
+    if include_mod_rs {
+        err.write_all(b"  - mod_rs\n").map_err(IoError::from)?;
+    }
+    err.flush().map_err(IoError::from)?;
 
     Ok(())
 }
@@ -468,12 +531,12 @@ fn add_mod_rs_to_report(mod_rs_result: &ModRsResult, global_report: &mut GlobalR
         let mut report = Report::new(issue.path.display().to_string());
 
         let analysis_result = AnalysisResult {
-            issues:        vec![Issue {
-                line:    issue.line,
-                column:  issue.column,
-                message: issue.message.clone(),
-                fix:     Fix::Simple(issue.suggested.display().to_string())
-            }],
+            issues:        vec![Issue::new(
+                issue.diagnostic.line,
+                issue.diagnostic.column,
+                issue.diagnostic.message.clone(),
+                Fix::Simple(issue.suggested.display().to_string())
+            )],
             fixable_count: 1
         };
 
@@ -507,7 +570,7 @@ fn add_mod_rs_to_report(mod_rs_result: &ModRsResult, global_report: &mut GlobalR
 /// fix_quality("src/", false, Some("path_import")).unwrap();
 /// ```
 fn fix_quality(path: &str, dry_run: bool, analyzer_name: Option<&str>) -> AppResult<()> {
-    let all_analyzers = get_analyzers();
+    let all_analyzers = default_analyzers();
 
     let analyzers: Vec<_> = if let Some(name) = analyzer_name {
         all_analyzers
@@ -522,13 +585,12 @@ fn fix_quality(path: &str, dry_run: bool, analyzer_name: Option<&str>) -> AppRes
         && analyzers.is_empty()
         && name != "mod_rs"
     {
-        eprintln!("Unknown analyzer: {}. Available analyzers:", name);
-        for analyzer in get_analyzers() {
-            eprintln!("  - {}", analyzer.name());
-        }
-        eprintln!("  - mod_rs");
+        report_unknown_analyzer(name, true)?;
         return Ok(());
     }
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
 
     let should_fix_mod_rs = analyzer_name.is_none() || analyzer_name == Some("mod_rs");
     if should_fix_mod_rs {
@@ -536,16 +598,18 @@ fn fix_quality(path: &str, dry_run: bool, analyzer_name: Option<&str>) -> AppRes
         if !mod_rs_result.is_empty() {
             if dry_run {
                 for issue in &mod_rs_result.issues {
-                    println!(
+                    writeln!(
+                        out,
                         "Would fix: {} -> {}",
                         issue.path.display(),
                         issue.suggested.display()
-                    );
+                    )
+                    .map_err(IoError::from)?;
                 }
             } else {
                 let fixed = fix_all_mod_rs(path)?;
                 if fixed > 0 {
-                    println!("Fixed {} mod.rs files", fixed);
+                    writeln!(out, "Fixed {} mod.rs files", fixed).map_err(IoError::from)?;
                 }
             }
         }
@@ -553,27 +617,36 @@ fn fix_quality(path: &str, dry_run: bool, analyzer_name: Option<&str>) -> AppRes
 
     if analyzer_name != Some("mod_rs") {
         let files = collect_rust_files(path)?;
+        let mut suggestions = Vec::new();
+
         for file_path in files {
             let content = fs::read_to_string(&file_path).map_err(IoError::from)?;
-            let mut ast = syn::parse_file(&content).map_err(ParseError::from)?;
+            let ast = syn::parse_file(&content).map_err(ParseError::from)?;
 
-            let mut total_fixed = 0;
-
+            suggestions.clear();
             for analyzer in &analyzers {
-                let fixed = analyzer.fix(&mut ast)?;
-                total_fixed += fixed;
+                suggestions.extend(analyzer.suggestions(&ast, &content)?);
             }
 
-            if total_fixed > 0 {
-                println!("Fixed {} issues in {}", total_fixed, file_path.display());
-
-                if !dry_run {
-                    let formatted = prettyplease::unparse(&ast);
-                    fs::write(&file_path, formatted).map_err(IoError::from)?;
-                }
+            let fixed = suggestions.len();
+            if fixed == 0 {
+                continue;
             }
+
+            if dry_run {
+                writeln!(out, "Would fix {} issues in {}", fixed, file_path.display())
+                    .map_err(IoError::from)?;
+                continue;
+            }
+
+            let updated = fixer::apply_suggestions(&content, &suggestions);
+            fs::write(&file_path, updated).map_err(IoError::from)?;
+            writeln!(out, "Fixed {} issues in {}", fixed, file_path.display())
+                .map_err(IoError::from)?;
         }
     }
+
+    out.flush().map_err(IoError::from)?;
 
     Ok(())
 }
@@ -627,7 +700,7 @@ fn run_diff(
     color: bool
 ) -> AppResult<()> {
     let files = collect_rust_files(path)?;
-    let all_analyzers = get_analyzers();
+    let all_analyzers = default_analyzers();
 
     let analyzers: Vec<_> = if let Some(name) = analyzer_name {
         all_analyzers
@@ -641,29 +714,46 @@ fn run_diff(
     if let Some(name) = analyzer_name
         && analyzers.is_empty()
     {
-        eprintln!("Unknown analyzer: {}. Available analyzers:", name);
-        for analyzer in get_analyzers() {
-            eprintln!("  - {}", analyzer.name());
-        }
+        report_unknown_analyzer(name, false)?;
         return Ok(());
     }
 
     let mut result = DiffResult::new();
 
-    for file_path in files {
-        let file_diff = generate_diff(file_path.to_str().unwrap_or(""), &analyzers)?;
-        result.add_file(file_diff);
+    {
+        let stderr = io::stderr();
+        let mut err = BufWriter::new(stderr.lock());
+
+        for file_path in files {
+            let Some(path_str) = file_path.to_str() else {
+                writeln!(err, "Skipping non-UTF-8 path: {}", file_path.display())
+                    .map_err(IoError::from)?;
+                continue;
+            };
+
+            let file_diff = generate_diff(path_str, &analyzers)?;
+            result.add_file(file_diff);
+        }
+
+        err.flush().map_err(IoError::from)?;
     }
 
     if result.total_changes() == 0 {
-        println!("No changes proposed");
+        io::stdout()
+            .lock()
+            .write_all(b"No changes proposed\n")
+            .map_err(IoError::from)?;
         return Ok(());
     }
 
     if summary {
         show_summary(&result, color);
     } else if interactive {
-        let _selected = show_interactive(&result, color)?;
+        let selected = show_interactive(&result, color)?;
+        if selected.total_changes() > 0 {
+            let applied = apply_diff(&selected)?;
+            writeln!(io::stdout().lock(), "Applied {} changes", applied).map_err(IoError::from)?;
+        }
     } else {
         show_full(&result, color);
     }
@@ -680,6 +770,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_install_fish_completions_uses_qual_subcommand() {
+        let temp_dir = TempDir::new().unwrap();
+        let comp_file = temp_dir.path().join("cargo.fish");
+
+        install_fish_completions(&comp_file).unwrap();
+
+        let content = fs::read_to_string(&comp_file).unwrap();
+        assert!(content.contains("__fish_seen_subcommand_from qual"));
+        assert!(!content.contains("__fish_seen_subcommand_from quality"));
+    }
+
+    #[test]
     fn test_check_quality() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.rs");
@@ -690,7 +792,29 @@ mod tests {
         .unwrap();
 
         let result = check_quality(temp_dir.path().to_str().unwrap(), false, None, false);
-        assert!(result.is_ok());
+        assert!(result.unwrap(), "issues present should return true");
+    }
+
+    #[test]
+    fn test_check_command_exit_codes() {
+        let temp_dir = TempDir::new().unwrap();
+        let dirty = temp_dir.path().join("dirty.rs");
+        fs::write(
+            &dirty,
+            "fn main() { let x = std::fs::read_to_string(\"f\"); }"
+        )
+        .unwrap();
+        assert_eq!(
+            check_command(dirty.to_str().unwrap(), false, None, false).unwrap(),
+            1
+        );
+
+        let clean = temp_dir.path().join("clean.rs");
+        fs::write(&clean, "fn main() {}").unwrap();
+        assert_eq!(
+            check_command(clean.to_str().unwrap(), false, None, false).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -761,7 +885,7 @@ mod tests {
     fn test_check_quality_no_files() {
         let temp_dir = TempDir::new().unwrap();
         let result = check_quality(temp_dir.path().to_str().unwrap(), false, None, false);
-        assert!(result.is_ok());
+        assert!(!result.unwrap(), "no files means no issues");
     }
 
     #[test]

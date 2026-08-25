@@ -9,8 +9,80 @@
 //! - `Issue` struct representing detected problems
 //! - `AnalysisResult` struct containing analysis outcomes
 
+use std::ops::Range;
+
 use masterror::AppResult;
 use syn::File;
+
+/// A single text replacement over the original source.
+///
+/// Fixes are expressed as byte-range edits against the untouched source text so
+/// that everything outside the edited range — comments, blank lines, and the
+/// author's formatting — is preserved. This mirrors how `rustfmt` and
+/// `rust-analyzer` apply changes, rather than reprinting the AST (which loses
+/// comments and reformats the whole file).
+///
+/// # Examples
+///
+/// ```
+/// use cargo_quality::analyzer::TextEdit;
+///
+/// let edit = TextEdit {
+///     range:       0..9,
+///     replacement: String::new()
+/// };
+/// assert_eq!(edit.range.len(), 9);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextEdit {
+    /// Byte range in the original source to replace
+    pub range:       Range<usize>,
+    /// Text to substitute for the range (empty to delete)
+    pub replacement: String
+}
+
+/// A `use` statement insertion anchored to a specific byte offset.
+///
+/// The offset addresses the module that must receive the import — the top of
+/// the file for top-level rewrites, or the first item of an inline module for
+/// rewrites inside it — so the inserted name is always in scope at the rewrite
+/// site.
+///
+/// # Examples
+///
+/// ```
+/// use cargo_quality::analyzer::ImportEdit;
+///
+/// let import = ImportEdit {
+///     offset:    0,
+///     statement: "use std::fs::read;".to_string()
+/// };
+/// assert!(import.statement.starts_with("use "));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEdit {
+    /// Byte offset in the original source at which to insert the statement
+    pub offset:    usize,
+    /// The `use` statement to insert, without a trailing newline
+    pub statement: String
+}
+
+/// A single fixable change: one source edit plus any import it requires.
+///
+/// Both the `fix` command and the diff/interactive flow are built from
+/// suggestions, so applying a change is identical everywhere: the [`edit`] is
+/// spliced into the source and the [`import`], if any, is inserted once per
+/// target offset (imports are deduplicated across the applied suggestions).
+///
+/// [`edit`]: Suggestion::edit
+/// [`import`]: Suggestion::import
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    /// The byte-range edit that performs the rewrite
+    pub edit:   TextEdit,
+    /// A `use` statement the rewrite depends on, if any
+    pub import: Option<ImportEdit>
+}
 
 /// Type of fix that can be applied to resolve an issue.
 ///
@@ -104,6 +176,32 @@ impl Fix {
     }
 }
 
+/// Location and description of a single finding in a source file.
+///
+/// Shared by every issue type so that reporting code works with one shape.
+///
+/// # Examples
+///
+/// ```
+/// use cargo_quality::analyzer::Diagnostic;
+///
+/// let diagnostic = Diagnostic {
+///     line:    42,
+///     column:  15,
+///     message: "Use import instead of path".to_string()
+/// };
+/// assert_eq!(diagnostic.line, 42);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// Line number where issue was found
+    pub line:    usize,
+    /// Column number
+    pub column:  usize,
+    /// Issue description
+    pub message: String
+}
+
 /// Analysis issue found in code.
 ///
 /// Represents a single quality issue detected by an analyzer, including
@@ -112,30 +210,52 @@ impl Fix {
 /// # Examples
 ///
 /// ```
-/// # use cargo_quality::analyzer::{Issue, Fix};
-/// let issue = Issue {
-///     line:    42,
-///     column:  15,
-///     message: "Use import instead of path".to_string(),
-///     fix:     Fix::WithImport {
+/// # use cargo_quality::analyzer::{Fix, Issue};
+/// let issue = Issue::new(
+///     42,
+///     15,
+///     "Use import instead of path".to_string(),
+///     Fix::WithImport {
 ///         import:      "use std::fs::read_to_string;".to_string(),
 ///         pattern:     "std::fs::read_to_string".to_string(),
 ///         replacement: "read_to_string".to_string()
 ///     }
-/// };
-/// assert_eq!(issue.line, 42);
+/// );
+/// assert_eq!(issue.diagnostic.line, 42);
 /// assert!(issue.fix.is_available());
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Issue {
-    /// Line number where issue was found
-    pub line:    usize,
-    /// Column number
-    pub column:  usize,
-    /// Issue description
-    pub message: String,
+    /// Where the issue was found and what it says
+    pub diagnostic: Diagnostic,
     /// Automatic fix
-    pub fix:     Fix
+    pub fix:        Fix
+}
+
+impl Issue {
+    /// Creates an issue from its location, message, and fix.
+    ///
+    /// # Arguments
+    ///
+    /// * `line` - Line number where the issue was found
+    /// * `column` - Column number
+    /// * `message` - Issue description
+    /// * `fix` - Automatic fix, or [`Fix::None`]
+    ///
+    /// # Returns
+    ///
+    /// The assembled issue
+    #[inline]
+    pub fn new(line: usize, column: usize, message: String, fix: Fix) -> Self {
+        Self {
+            diagnostic: Diagnostic {
+                line,
+                column,
+                message
+            },
+            fix
+        }
+    }
 }
 
 /// Result of code analysis.
@@ -183,10 +303,6 @@ pub struct AnalysisResult {
 ///     fn analyze(&self, ast: &File, content: &str) -> AppResult<AnalysisResult> {
 ///         Ok(AnalysisResult::default())
 ///     }
-///
-///     fn fix(&self, ast: &mut File) -> AppResult<usize> {
-///         Ok(0)
-///     }
 /// }
 /// ```
 pub trait Analyzer {
@@ -207,18 +323,24 @@ pub trait Analyzer {
     /// `AppResult<AnalysisResult>` - Analysis results or error
     fn analyze(&self, ast: &File, content: &str) -> AppResult<AnalysisResult>;
 
-    /// Apply automatic fixes to syntax tree.
+    /// Produce fixable suggestions for the detected issues.
     ///
-    /// Modifies the AST in-place to fix detected issues.
+    /// Each suggestion is a byte-range edit (plus an optional import) applied
+    /// against the original source, preserving everything outside the edited
+    /// ranges (comments, blank lines, formatting). The default implementation
+    /// returns none, for analyzers that are advisory only.
     ///
     /// # Arguments
     ///
-    /// * `ast` - Mutable syntax tree to fix
+    /// * `ast` - Parsed Rust syntax tree to fix
+    /// * `content` - Original source code the edits apply to
     ///
     /// # Returns
     ///
-    /// `AppResult<usize>` - Number of fixes applied or error
-    fn fix(&self, ast: &mut File) -> AppResult<usize>;
+    /// `AppResult<Vec<Suggestion>>` - Non-overlapping suggestions, or error
+    fn suggestions(&self, _ast: &File, _content: &str) -> AppResult<Vec<Suggestion>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -258,15 +380,15 @@ mod tests {
 
     #[test]
     fn test_issue_creation() {
-        let issue = Issue {
-            line:    42,
-            column:  10,
-            message: "Test issue".to_string(),
-            fix:     Fix::Simple("Fix suggestion".to_string())
-        };
+        let issue = Issue::new(
+            42,
+            10,
+            "Test issue".to_string(),
+            Fix::Simple("Fix suggestion".to_string())
+        );
 
-        assert_eq!(issue.line, 42);
-        assert_eq!(issue.column, 10);
+        assert_eq!(issue.diagnostic.line, 42);
+        assert_eq!(issue.diagnostic.column, 10);
         assert!(issue.fix.is_available());
     }
 

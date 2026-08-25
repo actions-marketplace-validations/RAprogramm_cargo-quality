@@ -14,16 +14,16 @@
 //! | [`PathImportAnalyzer`] | `std::fs::read()` paths | Yes |
 //! | [`FormatArgsAnalyzer`] | `println!("{}", x)` positional args | No |
 //! | [`EmptyLinesAnalyzer`] | Empty lines in functions | Yes |
-//! | [`InlineCommentsAnalyzer`] | `//` comments in code | No |
+//! | [`InlineCommentsAnalyzer`] | `//` comments in code | Yes |
 //!
 //! # Usage
 //!
 //! Get all analyzers:
 //!
 //! ```rust
-//! use cargo_quality::analyzers::get_analyzers;
+//! use cargo_quality::analyzers::default_analyzers;
 //!
-//! let analyzers = get_analyzers();
+//! let analyzers = default_analyzers();
 //! assert_eq!(analyzers.len(), 4);
 //! ```
 //!
@@ -119,13 +119,107 @@ pub mod empty_lines;
 pub mod format_args;
 pub mod inline_comments;
 pub mod path_import;
+pub mod visitor;
+
+use std::{collections::HashSet, ops::Range};
 
 pub use empty_lines::EmptyLinesAnalyzer;
 pub use format_args::FormatArgsAnalyzer;
 pub use inline_comments::InlineCommentsAnalyzer;
 pub use path_import::PathImportAnalyzer;
+use syn::{File, Lit, visit::Visit};
 
 use crate::analyzer::Analyzer;
+
+/// Collects line numbers that lie inside multi-line literals.
+///
+/// Line-based analyzers scan raw source text, so a `//` or a blank line inside
+/// a multi-line string literal would otherwise be mistaken for a comment or an
+/// empty function line. This returns every continuation line of such literals
+/// (the lines after the opening one, up to and including the closing one) so
+/// callers can skip them.
+///
+/// # Arguments
+///
+/// * `ast` - Parsed file to scan for literals
+///
+/// # Returns
+///
+/// Set of 1-based line numbers that fall inside a multi-line literal
+pub(crate) fn multiline_literal_lines(ast: &File) -> HashSet<usize> {
+    struct LitVisitor {
+        lines: HashSet<usize>
+    }
+
+    impl<'ast> Visit<'ast> for LitVisitor {
+        fn visit_lit(&mut self, lit: &'ast Lit) {
+            let span = lit.span();
+            let start = span.start().line;
+            let end = span.end().line;
+
+            if end > start {
+                for line in (start + 1)..=end {
+                    self.lines.insert(line);
+                }
+            }
+
+            syn::visit::visit_lit(self, lit);
+        }
+    }
+
+    let mut visitor = LitVisitor {
+        lines: HashSet::new()
+    };
+    visitor.visit_file(ast);
+    visitor.lines
+}
+
+/// Computes the byte offset at which every source line starts.
+///
+/// Suggestion builders translate 1-based line numbers from diagnostics into
+/// byte-range edits against the original source, so they need the starting
+/// offset of each line.
+///
+/// # Arguments
+///
+/// * `content` - Source code to index
+///
+/// # Returns
+///
+/// Vector whose element `n` is the byte offset where line `n + 1` starts
+pub(crate) fn line_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+/// Computes the byte range that removes an entire source line.
+///
+/// The range spans from the line start through its trailing newline, so
+/// deleting it leaves no blank residue behind.
+///
+/// # Arguments
+///
+/// * `offsets` - Line start offsets from [`line_offsets`]
+/// * `content_len` - Total source length in bytes
+/// * `line` - 1-based line number to delete
+///
+/// # Returns
+///
+/// Byte range covering the line, or `None` when the line does not exist
+pub(crate) fn line_deletion_range(
+    offsets: &[usize],
+    content_len: usize,
+    line: usize
+) -> Option<Range<usize>> {
+    let start = *offsets.get(line.checked_sub(1)?)?;
+    let end = offsets.get(line).copied().unwrap_or(content_len);
+    Some(start..end)
+}
 
 /// Returns all built-in analyzers.
 ///
@@ -143,16 +237,16 @@ use crate::analyzer::Analyzer;
 /// # Examples
 ///
 /// ```rust
-/// use cargo_quality::{analyzer::Analyzer, analyzers::get_analyzers};
+/// use cargo_quality::{analyzer::Analyzer, analyzers::default_analyzers};
 ///
-/// let analyzers = get_analyzers();
+/// let analyzers = default_analyzers();
 /// assert_eq!(analyzers.len(), 4);
 ///
 /// for analyzer in &analyzers {
 ///     println!("Analyzer: {}", analyzer.name());
 /// }
 /// ```
-pub fn get_analyzers() -> Vec<Box<dyn Analyzer>> {
+pub fn default_analyzers() -> Vec<Box<dyn Analyzer>> {
     vec![
         Box::new(PathImportAnalyzer::new()),
         Box::new(FormatArgsAnalyzer::new()),
@@ -166,14 +260,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_analyzers() {
-        let analyzers = get_analyzers();
+    fn test_default_analyzers() {
+        let analyzers = default_analyzers();
         assert_eq!(analyzers.len(), 4);
     }
 
     #[test]
     fn test_analyzer_names() {
-        let analyzers = get_analyzers();
+        let analyzers = default_analyzers();
         let names: Vec<&str> = analyzers.iter().map(|a| a.name()).collect();
 
         assert!(names.contains(&"path_import"));

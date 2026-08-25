@@ -4,7 +4,7 @@
 use console::measure_text_width;
 use owo_colors::OwoColorize;
 
-use super::{grid::MIN_FILE_WIDTH, grouping::group_imports, types::RenderedFile};
+use super::{grouping::group_imports, types::RenderedFile};
 use crate::differ::types::FileDiff;
 
 /// Estimated lines per file diff for pre-allocation.
@@ -82,7 +82,7 @@ pub fn render_file_block(file: &FileDiff, color: bool) -> RenderedFile {
 
     RenderedFile {
         lines,
-        width: max_width.max(MIN_FILE_WIDTH)
+        width: max_width.max(RenderedFile::MIN_WIDTH)
     }
 }
 
@@ -126,14 +126,14 @@ fn render_imports(lines: &mut Vec<String>, max_width: &mut usize, file: &FileDif
     let imports: Vec<&str> = file
         .entries
         .iter()
-        .filter_map(|e| e.import.as_deref())
+        .filter_map(|e| e.suggestion.import.as_ref().map(|i| i.statement.as_str()))
         .collect();
 
     if imports.is_empty() {
         return;
     }
 
-    let import_header = "Imports (file top)";
+    let import_header = "Imports";
     *max_width = (*max_width).max(measure_text_width(import_header));
 
     if color {
@@ -227,7 +227,7 @@ fn render_issue_entry(
         lines.push(line_header);
     }
 
-    let old_line = format!("-    {}", entry.original);
+    let old_line = format!("-    {}", entry.preview.original);
     *max_width = (*max_width).max(measure_text_width(&old_line));
 
     if color {
@@ -236,7 +236,7 @@ fn render_issue_entry(
         lines.push(old_line);
     }
 
-    let new_line = format!("+    {}", entry.modified);
+    let new_line = format!("+    {}", entry.preview.modified);
     *max_width = (*max_width).max(measure_text_width(&new_line));
 
     if color {
@@ -334,7 +334,10 @@ fn render_footer(lines: &mut Vec<String>, max_width: &mut usize, color: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::differ::types::{DiffEntry, FileDiff};
+    use crate::{
+        analyzer::{ImportEdit, Suggestion, TextEdit},
+        differ::types::{ChangePreview, DiffEntry, FileDiff}
+    };
 
     #[test]
     fn test_render_file_block_empty() {
@@ -342,19 +345,24 @@ mod tests {
         let rendered = render_file_block(&file, false);
 
         assert!(!rendered.lines.is_empty());
-        assert!(rendered.width >= MIN_FILE_WIDTH);
+        assert!(rendered.width >= RenderedFile::MIN_WIDTH);
     }
 
     #[test]
     fn test_render_file_block_with_entry() {
         let mut file = FileDiff::new("test.rs".to_string());
         file.add_entry(DiffEntry {
-            line:        10,
-            analyzer:    "test".to_string(),
-            original:    "old".to_string(),
-            modified:    "new".to_string(),
-            description: "desc".to_string(),
-            import:      None
+            line:       10,
+            analyzer:   "test".to_string(),
+            preview:    ChangePreview {
+                original:    "old".to_string(),
+                modified:    "new".to_string(),
+                description: "desc".to_string()
+            },
+            suggestion: Suggestion {
+                edit:   TextEdit::default(),
+                import: None
+            }
         });
 
         let rendered = render_file_block(&file, false);
@@ -365,12 +373,20 @@ mod tests {
     fn test_render_file_block_with_import() {
         let mut file = FileDiff::new("test.rs".to_string());
         file.add_entry(DiffEntry {
-            line:        10,
-            analyzer:    "path_import".to_string(),
-            original:    "std::fs::read()".to_string(),
-            modified:    "read()".to_string(),
-            description: "Use import".to_string(),
-            import:      Some("use std::fs::read;".to_string())
+            line:       10,
+            analyzer:   "path_import".to_string(),
+            preview:    ChangePreview {
+                original:    "std::fs::read()".to_string(),
+                modified:    "read()".to_string(),
+                description: "Use import".to_string()
+            },
+            suggestion: Suggestion {
+                edit:   TextEdit::default(),
+                import: Some(ImportEdit {
+                    offset:    0,
+                    statement: "use std::fs::read;".to_string()
+                })
+            }
         });
 
         let rendered = render_file_block(&file, false);
@@ -382,21 +398,31 @@ mod tests {
         let mut file = FileDiff::new("test.rs".to_string());
 
         file.add_entry(DiffEntry {
-            line:        10,
-            analyzer:    "analyzer1".to_string(),
-            original:    "old1".to_string(),
-            modified:    "new1".to_string(),
-            description: "desc1".to_string(),
-            import:      None
+            line:       10,
+            analyzer:   "analyzer1".to_string(),
+            preview:    ChangePreview {
+                original:    "old1".to_string(),
+                modified:    "new1".to_string(),
+                description: "desc1".to_string()
+            },
+            suggestion: Suggestion {
+                edit:   TextEdit::default(),
+                import: None
+            }
         });
 
         file.add_entry(DiffEntry {
-            line:        20,
-            analyzer:    "analyzer2".to_string(),
-            original:    "old2".to_string(),
-            modified:    "new2".to_string(),
-            description: "desc2".to_string(),
-            import:      None
+            line:       20,
+            analyzer:   "analyzer2".to_string(),
+            preview:    ChangePreview {
+                original:    "old2".to_string(),
+                modified:    "new2".to_string(),
+                description: "desc2".to_string()
+            },
+            suggestion: Suggestion {
+                edit:   TextEdit::default(),
+                import: None
+            }
         });
 
         let rendered = render_file_block(&file, false);

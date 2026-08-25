@@ -7,10 +7,16 @@
 //! which violate the Single Responsibility Principle by suggesting the
 //! function does multiple things.
 
-use masterror::AppResult;
-use syn::{File, ImplItem, Item, ItemFn, ItemImpl, spanned::Spanned, visit::Visit};
+use std::collections::HashSet;
 
-use crate::analyzer::{AnalysisResult, Analyzer, Fix, Issue};
+use masterror::AppResult;
+use syn::{File, ImplItem, ItemFn, ItemImpl, spanned::Spanned, visit::Visit};
+
+use super::{
+    line_deletion_range, line_offsets,
+    visitor::{FunctionVisitor, ItemCheckers, SourceView}
+};
+use crate::analyzer::{AnalysisResult, Analyzer, Fix, Issue, Suggestion, TextEdit};
 
 /// Analyzer for detecting empty lines inside functions and methods.
 ///
@@ -45,21 +51,28 @@ impl EmptyLinesAnalyzer {
     /// # Arguments
     ///
     /// * `func` - Function item to analyze
-    /// * `content` - Source code content
+    /// * `lines` - Source code split into lines
     ///
     /// # Returns
     ///
     /// Vector of issues found
-    fn check_block(start_line: usize, end_line: usize, content: &str) -> Vec<Issue> {
+    fn check_block(
+        start_line: usize,
+        end_line: usize,
+        lines: &[&str],
+        excluded: &HashSet<usize>
+    ) -> Vec<Issue> {
         let mut issues = Vec::new();
 
         if start_line >= end_line {
             return issues;
         }
 
-        let lines: Vec<&str> = content.lines().collect();
-
         for line_num in start_line..end_line {
+            if excluded.contains(&line_num) {
+                continue;
+            }
+
             let idx = line_num.saturating_sub(1);
 
             let Some(line) = lines.get(idx) else {
@@ -74,19 +87,18 @@ impl EmptyLinesAnalyzer {
                     continue;
                 }
 
-                if Self::is_after_opening_brace(&lines, idx)
-                    || Self::is_before_closing_brace(&lines, idx)
+                if Self::is_after_opening_brace(lines, idx)
+                    || Self::is_before_closing_brace(lines, idx)
                 {
                     continue;
                 }
 
-                issues.push(Issue {
-                    line:    line_num,
-                    column:  1,
-                    message: "Empty line in function body indicates untamed complexity"
-                        .to_string(),
-                    fix:     Fix::Simple(String::new())
-                });
+                issues.push(Issue::new(
+                    line_num,
+                    1,
+                    "Empty line in function body indicates untamed complexity".to_string(),
+                    Fix::Simple("Remove empty line".to_string())
+                ));
             }
         }
 
@@ -146,13 +158,13 @@ impl EmptyLinesAnalyzer {
     /// # Arguments
     ///
     /// * `func` - Function item to analyze
-    /// * `content` - Source code content
-    fn check_function(func: &ItemFn, content: &str) -> Vec<Issue> {
+    /// * `lines` - Source code split into lines
+    fn check_function(func: &ItemFn, lines: &[&str], excluded: &HashSet<usize>) -> Vec<Issue> {
         let span = func.block.span();
         let start_line = span.start().line;
         let end_line = span.end().line;
 
-        Self::check_block(start_line, end_line, content)
+        Self::check_block(start_line, end_line, lines, excluded)
     }
 
     /// Check impl block methods for empty lines.
@@ -160,8 +172,12 @@ impl EmptyLinesAnalyzer {
     /// # Arguments
     ///
     /// * `impl_block` - Impl block to analyze
-    /// * `content` - Source code content
-    fn check_impl_block(impl_block: &ItemImpl, content: &str) -> Vec<Issue> {
+    /// * `lines` - Source code split into lines
+    fn check_impl_block(
+        impl_block: &ItemImpl,
+        lines: &[&str],
+        excluded: &HashSet<usize>
+    ) -> Vec<Issue> {
         let mut issues = Vec::new();
 
         for item in &impl_block.items {
@@ -170,7 +186,7 @@ impl EmptyLinesAnalyzer {
                 let start_line = span.start().line;
                 let end_line = span.end().line;
 
-                issues.extend(Self::check_block(start_line, end_line, content));
+                issues.extend(Self::check_block(start_line, end_line, lines, excluded));
             }
         }
 
@@ -184,12 +200,20 @@ impl Analyzer for EmptyLinesAnalyzer {
     }
 
     fn analyze(&self, ast: &File, content: &str) -> AppResult<AnalysisResult> {
+        let lines: Vec<&str> = content.lines().collect();
+        let excluded = crate::analyzers::multiline_literal_lines(ast);
         let mut visitor = FunctionVisitor {
-            issues:  Vec::new(),
-            content: content.to_string()
+            issues:   Vec::new(),
+            source:   SourceView {
+                lines:    &lines,
+                excluded: &excluded
+            },
+            checkers: ItemCheckers {
+                function:   Self::check_function,
+                impl_block: Self::check_impl_block
+            }
         };
         visitor.visit_file(ast);
-
         let fixable_count = visitor.issues.len();
 
         Ok(AnalysisResult {
@@ -198,30 +222,28 @@ impl Analyzer for EmptyLinesAnalyzer {
         })
     }
 
-    fn fix(&self, _ast: &mut File) -> AppResult<usize> {
-        Ok(0)
-    }
-}
-
-struct FunctionVisitor {
-    issues:  Vec<Issue>,
-    content: String
-}
-
-impl<'ast> Visit<'ast> for FunctionVisitor {
-    fn visit_item(&mut self, node: &'ast Item) {
-        match node {
-            Item::Fn(func) => {
-                let func_issues = EmptyLinesAnalyzer::check_function(func, &self.content);
-                self.issues.extend(func_issues);
+    fn suggestions(&self, ast: &File, content: &str) -> AppResult<Vec<Suggestion>> {
+        let result = self.analyze(ast, content)?;
+        let offsets = line_offsets(content);
+        let mut seen = HashSet::new();
+        let mut suggestions = Vec::new();
+        for issue in result.issues {
+            let line = issue.diagnostic.line;
+            if !seen.insert(line) {
+                continue;
             }
-            Item::Impl(impl_block) => {
-                let impl_issues = EmptyLinesAnalyzer::check_impl_block(impl_block, &self.content);
-                self.issues.extend(impl_issues);
-            }
-            _ => {}
+            let Some(range) = line_deletion_range(&offsets, content.len(), line) else {
+                continue;
+            };
+            suggestions.push(Suggestion {
+                edit:   TextEdit {
+                    range,
+                    replacement: String::new()
+                },
+                import: None
+            });
         }
-        syn::visit::visit_item(self, node);
+        Ok(suggestions)
     }
 }
 
@@ -239,6 +261,16 @@ mod tests {
     fn test_analyzer_name() {
         let analyzer = EmptyLinesAnalyzer::new();
         assert_eq!(analyzer.name(), "empty_lines");
+    }
+
+    #[test]
+    fn test_ignore_blank_line_inside_string_literal() {
+        let analyzer = EmptyLinesAnalyzer::new();
+        let content = "fn f() {\n    let s = \"line one\n\nline two\";\n    let _ = s;\n}";
+        let code = syn::parse_str(content).unwrap();
+
+        let result = analyzer.analyze(&code, content).unwrap();
+        assert_eq!(result.issues.len(), 0);
     }
 
     #[test]
@@ -331,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fixable_count() {
+    fn test_issues_are_fixable() {
         let analyzer = EmptyLinesAnalyzer::new();
         let content = r#"fn main() {
     let x = 1;
@@ -343,20 +375,37 @@ mod tests {
         let result = analyzer.analyze(&code, content).unwrap();
         assert_eq!(result.fixable_count, 1);
         assert_eq!(result.issues.len(), 1);
+        assert!(result.issues[0].fix.is_available());
     }
 
     #[test]
-    fn test_fix_returns_zero() {
+    fn test_suggestions_delete_empty_line() {
         let analyzer = EmptyLinesAnalyzer::new();
-        let content = r#"fn main() {
-    let x = 1;
+        let content = "fn main() {\n    let x = 1;\n\n    let y = 2;\n}";
+        let code = syn::parse_str(content).unwrap();
 
-    let y = 2;
-}"#;
-        let mut code = syn::parse_str(content).unwrap();
+        let suggestions = analyzer.suggestions(&code, content).unwrap();
+        assert_eq!(suggestions.len(), 1);
 
-        let fixed = analyzer.fix(&mut code).unwrap();
-        assert_eq!(fixed, 0);
+        let fixed = crate::fixer::apply_suggestions(content, &suggestions);
+        assert_eq!(fixed, "fn main() {\n    let x = 1;\n    let y = 2;\n}");
+    }
+
+    #[test]
+    fn test_suggestions_delete_multiple_lines_bottom_up() {
+        let analyzer = EmptyLinesAnalyzer::new();
+        let content =
+            "fn process() {\n    let x = read();\n\n    let y = transform(x);\n\n    write(y);\n}";
+        let code = syn::parse_str(content).unwrap();
+
+        let suggestions = analyzer.suggestions(&code, content).unwrap();
+        assert_eq!(suggestions.len(), 2);
+
+        let fixed = crate::fixer::apply_suggestions(content, &suggestions);
+        assert_eq!(
+            fixed,
+            "fn process() {\n    let x = read();\n    let y = transform(x);\n    write(y);\n}"
+        );
     }
 
     #[test]
@@ -417,7 +466,7 @@ impl Foo {
 
         let result = analyzer.analyze(&code, content).unwrap();
         assert_eq!(result.issues.len(), 1);
-        assert_eq!(result.issues[0].line, 6);
+        assert_eq!(result.issues[0].diagnostic.line, 6);
     }
 
     #[test]
@@ -461,7 +510,7 @@ impl Foo {
 
         let result = analyzer.analyze(&code, content).unwrap();
         assert_eq!(result.issues.len(), 1);
-        assert_eq!(result.issues[0].line, 4);
+        assert_eq!(result.issues[0].diagnostic.line, 4);
     }
 
     #[test]
